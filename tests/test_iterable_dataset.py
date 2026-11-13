@@ -466,7 +466,8 @@ def test_rebatched_arrow_examples_iterable_restore_existing_partial_checkpoint(d
         assert table["id"].to_pylist() == expected_batch
         state = ex_iterable.state_dict()
         if expected_batch == [3, 4, 5]:
-            assert state["num_chunks_since_previous_state"] == 3
+            assert state["previous_state"] == {"shard_idx": 0, "shard_example_idx": 1, "type": "ArrowExamplesIterable"}
+            assert state["num_chunks_since_previous_state"] == 2
             assert state["cropped_chunk_length"] == 2
 
 
@@ -2787,8 +2788,11 @@ def test_iterable_dataset_state_dict_not_frozen_by_sibling_dataset(source_kind, 
 
 
 @pytest.mark.parametrize("source_kind", ["python", "arrow"])
-@pytest.mark.parametrize("transform", ["none", "map_batched", "interleave"])
-def test_iterable_dataset_state_dict_after_resume_matches_uninterrupted(source_kind, transform):
+@pytest.mark.parametrize(
+    "transform", ["none", "map_batched", "map_batched_arrow", "map_batched_arrow_direct", "interleave"]
+)
+@pytest.mark.parametrize("resume_at", [5, 7, 10])
+def test_iterable_dataset_state_dict_after_resume_matches_uninterrupted(source_kind, transform, resume_at):
     # On resume, a wrapping examples iterable reloads its inner iterable's state, which replaces the
     # inner state dict. The wrapper's nested state must follow it, otherwise state_dict() keeps
     # reporting the restored position of the inner iterable while the iteration moves on.
@@ -2802,20 +2806,29 @@ def test_iterable_dataset_state_dict_after_resume_matches_uninterrupted(source_k
         ds = make_source(list(range(8)))
         if transform == "map_batched":
             ds = ds.map(lambda batch: batch, batched=True, batch_size=3)
+        elif transform == "map_batched_arrow":
+            ds = concatenate_datasets(
+                [
+                    ds.with_format("arrow").map(lambda batch: batch, batched=True, batch_size=3),
+                    IterableDataset.from_generator(_generate_ids_by_shard, gen_kwargs={"shards": [10]}),
+                ]
+            )
+        elif transform == "map_batched_arrow_direct":
+            ds = ds.with_format("arrow").map(lambda batch: batch, batched=True, batch_size=3)
         elif transform == "interleave":
             ds = interleave_datasets([ds, make_source(list(range(10, 14)))])
         return ds
 
     uninterrupted = make_dataset()
     uninterrupted_iter = iter(uninterrupted)
-    for _ in range(5):
+    for _ in range(resume_at):
         next(uninterrupted_iter)
     resumed = make_dataset()
     resumed.load_state_dict(uninterrupted.state_dict())
     resumed_iter = iter(resumed)
     for _ in range(10):  # crosses several shards
         assert next(resumed_iter) == next(uninterrupted_iter)
-    assert resumed.state_dict() == uninterrupted.state_dict()
+        assert resumed.state_dict() == uninterrupted.state_dict()
 
 
 def test_mapped_arrow_with_indices_filtering_and_resume():

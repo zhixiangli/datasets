@@ -586,11 +586,22 @@ class RebatchedArrowExamplesIterable(_BaseExamplesIterable):
                     continue
                 elif num_chunks_to_skip == 1 and chunk_length_to_crop == 0:
                     num_chunks_to_skip -= 1
+                    if self._state_dict:
+                        self._state_dict["previous_state"] = previous_state
+                        self._state_dict["num_chunks_since_previous_state"] = num_chunks_since_previous_state + 1
+                        num_chunks_since_checkpoint = num_chunks_since_previous_state + 1
                     continue
                 elif num_chunks_to_skip == 1 and chunk_length_to_crop > 0:
-                    chunk = chunk.slice(chunk_length_to_crop, len(chunk) - chunk_length_to_crop)
+                    keys_buffer = [f"{key}[{chunk_length_to_crop}:]"]
+                    chunks_buffer = [chunk.slice(chunk_length_to_crop, len(chunk) - chunk_length_to_crop)]
+                    chunks_buffer_size = len(chunk) - chunk_length_to_crop
                     num_chunks_to_skip = 0
                     chunk_length_to_crop = 0
+                    if self._state_dict:
+                        self._state_dict["previous_state"] = previous_state
+                        self._state_dict["num_chunks_since_previous_state"] = num_chunks_since_previous_state
+                        num_chunks_since_checkpoint = num_chunks_since_previous_state + 1
+                    continue
                 if len(chunk) == 0:
                     continue
 
