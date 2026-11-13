@@ -2786,6 +2786,74 @@ def test_iterable_dataset_state_dict_not_frozen_by_sibling_dataset(source_kind, 
     assert seen + [example["id"] for example in resumed] == expected
 
 
+@pytest.mark.parametrize("source_kind", ["python", "arrow"])
+@pytest.mark.parametrize("transform", ["none", "map_batched", "interleave"])
+def test_iterable_dataset_state_dict_after_resume_matches_uninterrupted(source_kind, transform):
+    # On resume, a wrapping examples iterable reloads its inner iterable's state, which replaces the
+    # inner state dict. The wrapper's nested state must follow it, otherwise state_dict() keeps
+    # reporting the restored position of the inner iterable while the iteration moves on.
+    def make_source(shards):
+        if source_kind == "python":
+            return IterableDataset.from_generator(_generate_ids_by_shard, gen_kwargs={"shards": shards})
+        ids = [shard * 100 + i for shard in shards for i in range(4)]
+        return Dataset.from_dict({"id": ids}).to_iterable_dataset(num_shards=len(shards))
+
+    def make_dataset():
+        ds = make_source(list(range(8)))
+        if transform == "map_batched":
+            ds = ds.map(lambda batch: batch, batched=True, batch_size=3)
+        elif transform == "interleave":
+            ds = interleave_datasets([ds, make_source(list(range(10, 14)))])
+        return ds
+
+    uninterrupted = make_dataset()
+    uninterrupted_iter = iter(uninterrupted)
+    for _ in range(5):
+        next(uninterrupted_iter)
+    resumed = make_dataset()
+    resumed.load_state_dict(uninterrupted.state_dict())
+    resumed_iter = iter(resumed)
+    for _ in range(10):  # crosses several shards
+        assert next(resumed_iter) == next(uninterrupted_iter)
+    assert resumed.state_dict() == uninterrupted.state_dict()
+
+
+def test_mapped_arrow_with_indices_filtering_and_resume():
+    def keep_even_indices(table, indices):
+        keep = [i for i, idx in enumerate(indices) if idx % 2 == 0]
+        return pa.table(
+            {
+                "id": pa.array([table["id"][i].as_py() for i in keep], type=pa.int64()),
+                "idx": pa.array([indices[i] for i in keep], type=pa.int64()),
+            }
+        )
+
+    def make_dataset():
+        ds = Dataset.from_dict({"id": list(range(12))}).to_iterable_dataset(num_shards=3)
+        mapped = ds.with_format("arrow").map(keep_even_indices, batched=True, batch_size=3, with_indices=True)
+        tail = IterableDataset.from_generator(
+            lambda: iter([{"id": 100, "idx": -1}]),
+            features=Features({"id": Value("int64"), "idx": Value("int64")}),
+        )
+        return concatenate_datasets([mapped, tail])
+
+    uninterrupted = make_dataset()
+    uninterrupted_iter = iter(uninterrupted)
+    seen = [next(uninterrupted_iter) for _ in range(3)]
+    assert [row["idx"] for row in seen] == [0, 2, 4]
+
+    resumed = make_dataset()
+    resumed.load_state_dict(uninterrupted.state_dict())
+    resumed_iter = iter(resumed)
+    remaining = []
+    for expected_row in uninterrupted_iter:
+        actual_row = next(resumed_iter)
+        assert actual_row == expected_row
+        assert resumed.state_dict() == uninterrupted.state_dict()
+        remaining.append(actual_row)
+    assert [row["idx"] for row in remaining] == [6, 8, 10, -1]
+
+
 @pytest.mark.parametrize("method", ["skip", "take"])
 @pytest.mark.parametrize("source_kind", ["python", "arrow"])
 @pytest.mark.parametrize("shuffle_before", [False, True])
